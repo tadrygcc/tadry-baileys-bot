@@ -25,6 +25,8 @@ if (!API_URL) {
   console.error("Missing TADRY_API_URL env var. Point it at your tadry-web /api/bot endpoint.");
   process.exit(1);
 }
+console.log(`>>> TADRY_API_URL = ${API_URL}`);
+console.log(`>>> BOT_SHARED_SECRET length = ${(process.env.BOT_SHARED_SECRET || "").length}`);
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
