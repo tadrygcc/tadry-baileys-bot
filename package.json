@@ -1,0 +1,19 @@
+{
+  "name": "tadry-baileys-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tadry WhatsApp bot on Baileys (unofficial). Forwards each user message to tadry-web /api/bot and sends the reply back.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.10",
+    "pino": "^9.5.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
