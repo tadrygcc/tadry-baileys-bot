@@ -56,15 +56,19 @@ function appendHistory(jid, role, text) {
 }
 
 const GREETING = [
-  "أهلاً بك في «تدري» — أرشيف حلقات عن جيوسياسة الخليج وإيران والعراق وسوريا ولبنان.",
+  "*تدري؟*",
+  "_أرشيف جيوسياسة الخليج وإيران._",
   "",
-  "اسألني عن أيّ موضوع أو حلقة، مثلاً:",
-  "• «الحلقة 53» — لأرسل الحلقة مباشرة",
-  "• «متى سقط الأسد؟» — لأجيبك من مصادر موثّقة",
-  "• «ما موقف تدري من اتفاق إبراهيم؟» — لأدلّك على الحلقات ذات الصلة",
+  "اسألني عن أيّ موضوع أو حلقة:",
   "",
-  "المصادر الكاملة على tadrygcc.com",
+  "› *«الحلقة 53»* — لأرسل الحلقة مباشرةً",
+  "› *«متى سقط الأسد؟»* — للإجابة من مصادر موثّقة",
+  "› *«سوريا»* — لأعرض لك ما غطّاه تدري وأخترتَ الزاوية",
+  "",
+  "— *tadrygcc.com*",
 ].join("\n");
+
+const BRAND_FOOTER = "\n\n—\n_اسأل تدري؟ · tadrygcc.com_";
 
 // ------------------------------------------------------------
 
@@ -93,21 +97,44 @@ async function downloadVideo(url) {
   return buf;
 }
 
+// Same for cover PNGs — Baileys wants bytes to render a proper image
+// message (not a link preview).
+async function downloadImage(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`image download ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  return buf;
+}
+
 async function sendReply(sock, jid, reply) {
-  // 1) The answer text (curator-style, no bullet-list of sources).
-  if (reply.text && reply.text.trim().length > 0) {
-    await sock.sendMessage(jid, { text: reply.text });
+  // 1) Cover image — shows the episode's artwork prominently as the visual
+  //    anchor of the reply. Baileys downloads bytes and sends as a proper
+  //    image message (not a link preview).
+  if (reply.cover) {
+    try {
+      const imgBuf = await downloadImage(reply.cover.url);
+      await sock.sendMessage(jid, {
+        image: imgBuf,
+        caption: reply.cover.caption,
+      });
+    } catch (err) {
+      log.warn({ err: String(err) }, "cover send failed, skipping");
+    }
   }
 
-  // 2) The sources link — points at the entry's page on tadrygcc.com.
-  //    WhatsApp will fetch the URL and show a preview card automatically.
+  // 2) The answer text with brand footer appended.
+  if (reply.text && reply.text.trim().length > 0) {
+    await sock.sendMessage(jid, { text: reply.text + BRAND_FOOTER });
+  }
+
+  // 3) Sources link on tadrygcc.com — WhatsApp shows a link preview card.
   if (reply.entry_url) {
     await sock.sendMessage(jid, {
-      text: `المصادر الكاملة على الموقع:\n${reply.entry_url}`,
+      text: `_المصادر الكاملة:_\n${reply.entry_url}`,
     });
   }
 
-  // 3) The video: MP4 (downloaded → sent as Buffer so duration + thumbnail
+  // 4) The video: MP4 (downloaded → sent as Buffer so duration + thumbnail
   //    render correctly) or Instagram/TikTok link (WhatsApp preview).
   if (reply.video) {
     if (reply.video.is_mp4) {
