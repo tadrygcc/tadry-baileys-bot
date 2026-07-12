@@ -110,16 +110,20 @@ async function sendReply(sock, jid, reply) {
   // 1) Cover image — shows the episode's artwork prominently as the visual
   //    anchor of the reply. Baileys downloads bytes and sends as a proper
   //    image message (not a link preview).
-  if (reply.cover) {
+  if (reply.cover?.url) {
+    log.info({ url: reply.cover.url }, "sending cover");
     try {
       const imgBuf = await downloadImage(reply.cover.url);
       await sock.sendMessage(jid, {
         image: imgBuf,
         caption: reply.cover.caption,
       });
+      log.info("cover sent");
     } catch (err) {
-      log.warn({ err: String(err) }, "cover send failed, skipping");
+      log.error({ err: String(err), url: reply.cover.url }, "cover send failed");
     }
+  } else {
+    log.info({ has_cover: !!reply.cover }, "no cover in reply");
   }
 
   // 2) The answer text with brand footer appended.
