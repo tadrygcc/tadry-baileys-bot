@@ -1,15 +1,18 @@
 // Tadry WhatsApp bot on Baileys (unofficial).
 // - Connects to WhatsApp as the Tadry number via QR-code pairing (one-time)
 // - Persists session in ./auth_info (mount a Railway volume here to survive restarts)
-// - On each incoming user message, POSTs { text, from_id } to TADRY_API_URL
-// - Renders the JSON reply into WhatsApp messages (text + video/link when present)
-// - Rate-limit and refusal logic all live in /api/bot on tadry-web
+// - On each incoming user message, POSTs { text, from_id, history } to TADRY_API_URL
+// - Renders the JSON reply into WhatsApp messages:
+//     answer text → sources link (tadrygcc.com/v/{id}) → video (mp4 or link)
+// - Multi-turn: remembers last 3 exchanges per phone (in-memory, TTL 30 min)
+// - Greets new phones once on their first message
 
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
   makeCacheableSignalKeyStore,
+  Browsers,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import qrcodeTerminal from "qrcode-terminal";
@@ -25,14 +28,54 @@ if (!API_URL) {
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
-async function askTadry({ text, fromId }) {
+// ------------------------------------------------------------
+// Per-user memory: history + first-message greeting bookkeeping
+// ------------------------------------------------------------
+
+const HISTORY_MAX_PER_USER = 6; // 3 exchanges
+const HISTORY_TTL_MS = 30 * 60 * 1000; // 30 min
+const historyByUser = new Map(); // jid → { turns: [{role,text}], updatedAt }
+const greetedUsers = new Set(); // jid → seen at least once
+
+function recentHistory(jid) {
+  const h = historyByUser.get(jid);
+  if (!h) return [];
+  if (Date.now() - h.updatedAt > HISTORY_TTL_MS) {
+    historyByUser.delete(jid);
+    return [];
+  }
+  return h.turns;
+}
+
+function appendHistory(jid, role, text) {
+  const cur = historyByUser.get(jid);
+  const turns = cur && Date.now() - cur.updatedAt <= HISTORY_TTL_MS ? cur.turns : [];
+  turns.push({ role, text });
+  while (turns.length > HISTORY_MAX_PER_USER) turns.shift();
+  historyByUser.set(jid, { turns, updatedAt: Date.now() });
+}
+
+const GREETING = [
+  "أهلاً بك في «تدري» — أرشيف حلقات عن جيوسياسة الخليج وإيران والعراق وسوريا ولبنان.",
+  "",
+  "اسألني عن أيّ موضوع أو حلقة، مثلاً:",
+  "• «الحلقة 53» — لأرسل الحلقة مباشرة",
+  "• «متى سقط الأسد؟» — لأجيبك من مصادر موثّقة",
+  "• «ما موقف تدري من اتفاق إبراهيم؟» — لأدلّك على الحلقات ذات الصلة",
+  "",
+  "المصادر الكاملة على tadrygcc.com",
+].join("\n");
+
+// ------------------------------------------------------------
+
+async function askTadry({ text, fromId, history }) {
   const r = await fetch(API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-bot-secret": API_SECRET,
     },
-    body: JSON.stringify({ text, from_id: fromId }),
+    body: JSON.stringify({ text, from_id: fromId, history }),
   });
   if (!r.ok) {
     throw new Error(`bot api ${r.status}: ${await r.text().catch(() => "")}`);
@@ -40,27 +83,57 @@ async function askTadry({ text, fromId }) {
   return r.json();
 }
 
+// Download an MP4 URL into a Buffer. Baileys extracts duration and
+// thumbnail from the file bytes at send time; sending by { url: '...' }
+// alone yields a 0:00 duration in WhatsApp until you tap play.
+async function downloadVideo(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`video download ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  return buf;
+}
+
 async function sendReply(sock, jid, reply) {
-  // Order matters: send the answer text first, then attach the video/link
-  // as a follow-up so WhatsApp doesn't visually swallow the text.
+  // 1) The answer text (curator-style, no bullet-list of sources).
   if (reply.text && reply.text.trim().length > 0) {
     await sock.sendMessage(jid, { text: reply.text });
   }
+
+  // 2) The sources link — points at the entry's page on tadrygcc.com.
+  //    WhatsApp will fetch the URL and show a preview card automatically.
+  if (reply.entry_url) {
+    await sock.sendMessage(jid, {
+      text: `المصادر الكاملة على الموقع:\n${reply.entry_url}`,
+    });
+  }
+
+  // 3) The video: MP4 (downloaded → sent as Buffer so duration + thumbnail
+  //    render correctly) or Instagram/TikTok link (WhatsApp preview).
   if (reply.video) {
     if (reply.video.is_mp4) {
       try {
+        const buf = await downloadVideo(reply.video.url);
         await sock.sendMessage(jid, {
-          video: { url: reply.video.url },
+          video: buf,
           caption: reply.video.caption,
+          mimetype: "video/mp4",
         });
       } catch (err) {
-        log.warn({ err: String(err) }, "video send failed, falling back to link");
-        await sock.sendMessage(jid, {
-          text: `${reply.video.caption ? reply.video.caption + "\n" : ""}${reply.video.url}`,
-        });
+        log.warn({ err: String(err) }, "mp4 send failed, falling back to URL");
+        try {
+          await sock.sendMessage(jid, {
+            video: { url: reply.video.url },
+            caption: reply.video.caption,
+            mimetype: "video/mp4",
+          });
+        } catch (err2) {
+          log.warn({ err: String(err2) }, "url send also failed, sending as link");
+          await sock.sendMessage(jid, {
+            text: `${reply.video.caption ? reply.video.caption + "\n" : ""}${reply.video.url}`,
+          });
+        }
       }
-    } else if (!reply.text?.includes(reply.video.url)) {
-      // Link path — send as text so WhatsApp shows a preview.
+    } else {
       await sock.sendMessage(jid, {
         text: `${reply.video.caption ? reply.video.caption + "\n" : ""}${reply.video.url}`,
       });
@@ -91,10 +164,15 @@ async function start() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, log),
     },
-    // We don't want the bot to appear "online" 24/7 — that's a spam signal.
+    // Don't appear "online" 24/7 — spam signal.
     markOnlineOnConnect: false,
     printQRInTerminal: false,
-    browser: ["Tadry Bot", "Chrome", "1.0.0"],
+    // Standard browser fingerprint. Custom identity strings ("Tadry Bot")
+    // sometimes trip WhatsApp Business App's anti-fraud checks.
+    browser: Browsers.ubuntu("Chrome"),
+    // Skip long history sync on first connect — we only care about
+    // messages arriving after the bot is linked.
+    syncFullHistory: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -104,11 +182,7 @@ async function start() {
     if (qr) {
       console.log("\n=== SCAN THIS QR FROM YOUR TADRY WHATSAPP BUSINESS APP ===");
       console.log("Settings → Linked Devices → Link a Device\n");
-      // Terminal QR — for anyone with a scanner-friendly console. Often
-      // hard to scan when logs are rendered by Railway/etc.
       qrcodeTerminal.generate(qr, { small: true });
-      // Scannable-in-browser fallback: open this URL and scan from the
-      // resulting image (much more reliable than the ASCII version).
       const encoded = encodeURIComponent(qr);
       console.log("\n>>> If the ASCII QR above won't scan, open THIS URL");
       console.log(">>> in your browser (any device) and scan it from there:\n");
@@ -135,10 +209,9 @@ async function start() {
     if (type !== "notify") return;
     for (const m of messages) {
       try {
-        // Ignore our own messages and status broadcasts.
         if (m.key.fromMe) continue;
         if (m.key.remoteJid?.endsWith("@broadcast")) continue;
-        if (!m.key.remoteJid || m.key.remoteJid.endsWith("@g.us")) continue; // no groups
+        if (!m.key.remoteJid || m.key.remoteJid.endsWith("@g.us")) continue;
         if (!m.key.id || !firstTime(m.key.id)) continue;
 
         const text =
@@ -151,14 +224,27 @@ async function start() {
         const fromId = m.key.remoteJid;
         log.info({ from: fromId, len: text.length }, "incoming");
 
-        // Nudge WhatsApp UI to show "typing…" while we wait on the LLM.
+        // First-time greeting. Send once per jid per bot lifetime.
+        if (!greetedUsers.has(fromId)) {
+          greetedUsers.add(fromId);
+          try {
+            await sock.sendMessage(fromId, { text: GREETING });
+          } catch (err) {
+            log.warn({ err: String(err) }, "greeting failed");
+          }
+        }
+
         try {
           await sock.sendPresenceUpdate("composing", fromId);
         } catch {}
 
         let reply;
         try {
-          reply = await askTadry({ text, fromId });
+          reply = await askTadry({
+            text,
+            fromId,
+            history: recentHistory(fromId),
+          });
         } catch (err) {
           log.error({ err: String(err) }, "askTadry failed");
           await sock.sendMessage(fromId, {
@@ -176,6 +262,13 @@ async function start() {
           log.info({ from: fromId, kind: reply.kind }, "replied");
         } catch (err) {
           log.error({ err: String(err) }, "send failed");
+        }
+
+        // Record the exchange for multi-turn context. Keep only textual
+        // parts (the video/URLs don't help future retrieval).
+        appendHistory(fromId, "user", text);
+        if (reply.text && reply.text.trim().length > 0) {
+          appendHistory(fromId, "assistant", reply.text);
         }
       } catch (err) {
         log.error({ err: String(err) }, "message handler outer");
