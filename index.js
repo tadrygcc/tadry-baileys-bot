@@ -104,7 +104,15 @@ async function start() {
     if (qr) {
       console.log("\n=== SCAN THIS QR FROM YOUR TADRY WHATSAPP BUSINESS APP ===");
       console.log("Settings → Linked Devices → Link a Device\n");
+      // Terminal QR — for anyone with a scanner-friendly console. Often
+      // hard to scan when logs are rendered by Railway/etc.
       qrcodeTerminal.generate(qr, { small: true });
+      // Scannable-in-browser fallback: open this URL and scan from the
+      // resulting image (much more reliable than the ASCII version).
+      const encoded = encodeURIComponent(qr);
+      console.log("\n>>> If the ASCII QR above won't scan, open THIS URL");
+      console.log(">>> in your browser (any device) and scan it from there:\n");
+      console.log(`https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encoded}`);
       console.log("\n(waiting for scan...)\n");
     }
     if (connection === "open") {
