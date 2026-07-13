@@ -16,10 +16,25 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import qrcodeTerminal from "qrcode-terminal";
+import cron from "node-cron";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const API_URL = process.env.TADRY_API_URL;
 const API_SECRET = process.env.BOT_SHARED_SECRET || "";
 const AUTH_DIR = process.env.AUTH_DIR || "./auth_info";
+
+// The daily brief push: cron on the volume-persistent subscribers list.
+// Volume is mounted at /data (same as AUTH_DIR's parent) so restarts don't
+// lose subscribers. Defaults chosen so no env vars are needed for the
+// happy path — user just needs the Railway volume mount at /data.
+const DATA_DIR = process.env.DATA_DIR || path.dirname(AUTH_DIR);
+const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
+const BRIEF_CRON = process.env.BRIEF_CRON || "0 20 * * *"; // 20:00 daily
+const BRIEF_TZ = process.env.BRIEF_TZ || "Asia/Riyadh";
+const BRIEF_ENABLED = process.env.BRIEF_ENABLED !== "false";
+// Derive /api/brief URL from /api/bot so we don't need a second env var.
+const BRIEF_URL = API_URL ? API_URL.replace(/\/api\/bot\/?$/, "/api/brief") : "";
 
 if (!API_URL) {
   console.error("Missing TADRY_API_URL env var. Point it at your tadry-web /api/bot endpoint.");
@@ -66,11 +81,104 @@ const GREETING = [
   "› *«الحلقة 53»* — لأرسل لك الحلقة مباشرةً.",
   "› *«متى سقط الأسد؟»* — للإجابة بمصادرها الأصليّة.",
   "› *«سوريا»* — لأعرض ما غطّاه تدري، وتختار الزاوية.",
+  "› *«موجز»* — لموجز اليوم في الخليج والمنطقة.",
+  "› *«اشتراك»* — ليوصلك الموجز كلّ ليلة ٨ مساءً بتوقيت الخليج.",
   "",
   "— *tadrygcc.com*",
 ].join("\n");
 
 const BRAND_FOOTER = "\n\n—\n_اسأل تدري؟ · tadrygcc.com_";
+
+// ------------------------------------------------------------
+// Subscribers: persistent set of jids that want the daily push
+// ------------------------------------------------------------
+
+let subscribers = new Set();
+
+async function loadSubscribers() {
+  try {
+    const raw = await fs.readFile(SUBSCRIBERS_FILE, "utf8");
+    const arr = JSON.parse(raw);
+    subscribers = new Set(Array.isArray(arr) ? arr : []);
+    log.info(`loaded ${subscribers.size} subscriber(s) from ${SUBSCRIBERS_FILE}`);
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      log.info(`no subscribers file at ${SUBSCRIBERS_FILE} yet — starting empty`);
+    } else {
+      log.warn({ err: String(err) }, "failed to load subscribers — starting empty");
+    }
+    subscribers = new Set();
+  }
+}
+
+async function saveSubscribers() {
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    await fs.writeFile(
+      SUBSCRIBERS_FILE,
+      JSON.stringify([...subscribers], null, 2)
+    );
+  } catch (err) {
+    log.error({ err: String(err) }, "failed to save subscribers");
+  }
+}
+
+// اشتراك / اشترك / subscribe — match the whole trimmed message so a
+// mid-sentence mention doesn't accidentally toggle. Same for unsubscribe.
+const SUBSCRIBE_RE = /^\s*(?:اشتراك|اشترك|subscribe|الاشتراك|start)\s*[?؟.!]*\s*$/i;
+const UNSUBSCRIBE_RE = /^\s*(?:إيقاف|ايقاف|إلغاء|الغاء|الغاء\s+الاشتراك|إلغاء\s+الاشتراك|توقف|stop|unsubscribe)\s*[?؟.!]*\s*$/i;
+
+function isSubscribeIntent(text) {
+  return SUBSCRIBE_RE.test(text);
+}
+function isUnsubscribeIntent(text) {
+  return UNSUBSCRIBE_RE.test(text);
+}
+
+// Fetch the current cached brief text from tadry-web and push it to
+// every subscriber. Small delay between sends to avoid tripping WA
+// spam heuristics on a fan-out. Failures per-recipient are logged but
+// do not abort the run.
+async function fetchTodaysBrief() {
+  const r = await fetch(BRIEF_URL, {
+    method: "GET",
+    headers: { "x-bot-secret": API_SECRET },
+  });
+  if (!r.ok) throw new Error(`brief api ${r.status}: ${await r.text().catch(() => "")}`);
+  const data = await r.json();
+  if (!data.text || typeof data.text !== "string") {
+    throw new Error("brief api returned no text");
+  }
+  return data.text;
+}
+
+async function pushBriefToAllSubscribers(sock) {
+  if (subscribers.size === 0) {
+    log.info("scheduled push: no subscribers");
+    return;
+  }
+  let text;
+  try {
+    text = await fetchTodaysBrief();
+  } catch (err) {
+    log.error({ err: String(err) }, "scheduled push: fetch brief failed");
+    return;
+  }
+  const body = text + BRAND_FOOTER;
+  let sent = 0;
+  for (const jid of subscribers) {
+    try {
+      await sock.sendMessage(jid, { text: body });
+      sent++;
+      // 500ms between sends — WhatsApp's fan-out guardrails are lax at
+      // this scale but zero delay looks bot-shaped.
+      await new Promise((res) => setTimeout(res, 500));
+    } catch (err) {
+      log.warn({ err: String(err), jid }, "scheduled push: send failed");
+    }
+  }
+  log.info(`scheduled push: sent ${sent}/${subscribers.size}`);
+}
 
 // ------------------------------------------------------------
 
@@ -187,6 +295,8 @@ function firstTime(id) {
 }
 
 async function start() {
+  await loadSubscribers();
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -224,6 +334,27 @@ async function start() {
     }
     if (connection === "open") {
       log.info("connected to WhatsApp as Tadry");
+      // Arm the daily brief cron the first time we successfully connect.
+      // Reconnects re-enter this branch but node-cron's schedule is
+      // idempotent per (cron, callback, tz) key — we guard with a flag.
+      if (BRIEF_ENABLED && !global.__briefCronArmed) {
+        global.__briefCronArmed = true;
+        if (!cron.validate(BRIEF_CRON)) {
+          log.error({ BRIEF_CRON }, "invalid BRIEF_CRON expression — push disabled");
+        } else {
+          cron.schedule(
+            BRIEF_CRON,
+            () => {
+              log.info("scheduled brief push firing");
+              pushBriefToAllSubscribers(sock).catch((err) =>
+                log.error({ err: String(err) }, "scheduled push crashed")
+              );
+            },
+            { timezone: BRIEF_TZ }
+          );
+          log.info(`brief push armed: cron="${BRIEF_CRON}" tz=${BRIEF_TZ}`);
+        }
+      }
     }
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -265,6 +396,37 @@ async function start() {
           } catch (err) {
             log.warn({ err: String(err) }, "greeting failed");
           }
+        }
+
+        // Subscribe / unsubscribe handled locally — never hits /api/bot.
+        // Idempotent by design so repeated «اشتراك» from the same person
+        // reassures them rather than errors.
+        if (isSubscribeIntent(text)) {
+          const wasNew = !subscribers.has(fromId);
+          subscribers.add(fromId);
+          await saveSubscribers();
+          const msg = wasNew
+            ? "✓ اشتركت في *موجز تدري* ☕\n_يوصلك كلّ ليلة الساعة ٨ مساءً بتوقيت الخليج._\n\nتبي توقف؟ اكتب *«إيقاف»*."
+            : "أنت مشترك بالفعل في *موجز تدري* ☕\n_يوصلك كلّ ليلة ٨ مساءً بتوقيت الخليج._";
+          try {
+            await sock.sendMessage(fromId, { text: msg + BRAND_FOOTER });
+          } catch (err) {
+            log.warn({ err: String(err) }, "subscribe ack failed");
+          }
+          continue;
+        }
+        if (isUnsubscribeIntent(text)) {
+          const wasSubscribed = subscribers.delete(fromId);
+          if (wasSubscribed) await saveSubscribers();
+          const msg = wasSubscribed
+            ? "أوقفت اشتراكك في الموجز. ترجع أيّ وقت بكلمة *«اشتراك»*."
+            : "ما كنت مشترك أصلاً. تقدر تشترك بكلمة *«اشتراك»*.";
+          try {
+            await sock.sendMessage(fromId, { text: msg + BRAND_FOOTER });
+          } catch (err) {
+            log.warn({ err: String(err) }, "unsubscribe ack failed");
+          }
+          continue;
         }
 
         try {
