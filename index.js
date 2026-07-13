@@ -30,7 +30,7 @@ const AUTH_DIR = process.env.AUTH_DIR || "./auth_info";
 // happy path — user just needs the Railway volume mount at /data.
 const DATA_DIR = process.env.DATA_DIR || path.dirname(AUTH_DIR);
 const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
-const BRIEF_CRON = process.env.BRIEF_CRON || "0 20 * * *"; // 20:00 daily
+const BRIEF_CRON = process.env.BRIEF_CRON || "0 8 * * *"; // 08:00 daily (coffee slot)
 const BRIEF_TZ = process.env.BRIEF_TZ || "Asia/Riyadh";
 const BRIEF_ENABLED = process.env.BRIEF_ENABLED !== "false";
 // Derive /api/brief URL from /api/bot so we don't need a second env var.
@@ -82,7 +82,7 @@ const GREETING = [
   "› *«متى سقط الأسد؟»* — للإجابة بمصادرها الأصليّة.",
   "› *«سوريا»* — لأعرض ما غطّاه تدري، وتختار الزاوية.",
   "› *«موجز»* — لموجز اليوم في الخليج والمنطقة.",
-  "› *«اشتراك»* — ليوصلك الموجز كلّ ليلة ٨ مساءً بتوقيت الخليج.",
+  "› *«اشتراك»* — ليوصلك الموجز كلّ صباح الساعة ٨ بتوقيت الخليج.",
   "",
   "— *tadrygcc.com*",
 ].join("\n");
@@ -406,8 +406,8 @@ async function start() {
           subscribers.add(fromId);
           await saveSubscribers();
           const msg = wasNew
-            ? "✓ اشتركت في *موجز تدري* ☕\n_يوصلك كلّ ليلة الساعة ٨ مساءً بتوقيت الخليج._\n\nتبي توقف؟ اكتب *«إيقاف»*."
-            : "أنت مشترك بالفعل في *موجز تدري* ☕\n_يوصلك كلّ ليلة ٨ مساءً بتوقيت الخليج._";
+            ? "✓ اشتركت في *موجز تدري* ☕\n_يوصلك كلّ صباح الساعة ٨ بتوقيت الخليج، مع قهوتك._\n\nتبي توقف؟ اكتب *«إيقاف»*."
+            : "أنت مشترك بالفعل في *موجز تدري* ☕\n_يوصلك كلّ صباح الساعة ٨ بتوقيت الخليج._";
           try {
             await sock.sendMessage(fromId, { text: msg + BRAND_FOOTER });
           } catch (err) {
