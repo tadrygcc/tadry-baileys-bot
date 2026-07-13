@@ -33,8 +33,9 @@ const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
 const BRIEF_CRON = process.env.BRIEF_CRON || "0 8 * * *"; // 08:00 daily (coffee slot)
 const BRIEF_TZ = process.env.BRIEF_TZ || "Asia/Riyadh";
 const BRIEF_ENABLED = process.env.BRIEF_ENABLED !== "false";
-// Derive /api/brief URL from /api/bot so we don't need a second env var.
+// Derive sibling API URLs from /api/bot so we don't need extra env vars.
 const BRIEF_URL = API_URL ? API_URL.replace(/\/api\/bot\/?$/, "/api/brief") : "";
+const GREETING_URL = API_URL ? API_URL.replace(/\/api\/bot\/?$/, "/api/greeting") : "";
 
 if (!API_URL) {
   console.error("Missing TADRY_API_URL env var. Point it at your tadry-web /api/bot endpoint.");
@@ -72,20 +73,47 @@ function appendHistory(jid, role, text) {
   historyByUser.set(jid, { turns, updatedAt: Date.now() });
 }
 
-const GREETING = [
+// Hardcoded fallback greeting — only used if /api/greeting is unreachable.
+// The real greeting comes from the server so we can tweak it (add new
+// commands, refresh the latest-5 list) without redeploying Baileys.
+const GREETING_FALLBACK = [
   "*تدري؟*",
-  "_بوت جيوسياسة الخليج وإيران. أجيب من الأرشيف بمصادر موثّقة — لا اختراع ولا تلفيق._",
+  "_محاور جيوسياسة منطقتنا — العالم العربيّ وإيران. أجيب من الأرشيف بمصادر موثّقة، لا اختراع ولا تلفيق._",
   "",
-  "اسألني عن أيّ موضوع أو حلقة. *مثلاً:*",
-  "",
-  "› *«الحلقة 53»* — لأرسل لك الحلقة مباشرةً.",
-  "› *«متى سقط الأسد؟»* — للإجابة بمصادرها الأصليّة.",
-  "› *«سوريا»* — لأعرض ما غطّاه تدري، وتختار الزاوية.",
-  "› *«موجز»* — لموجز اليوم في الخليج والمنطقة.",
-  "› *«اشتراك»* — ليوصلك الموجز كلّ صباح الساعة ٨ بتوقيت الخليج.",
+  "*جرّب:*",
+  "› اكتب رقم حلقة (مثال: *«الحلقة 53»*)",
+  "› اكتب اسم دولة أو موضوع (مثال: *«سوريا»*)",
+  "› *«موجز»* — لموجز اليوم في المنطقة",
+  "› *«اشتراك»* — ليوصلك الموجز الصباحي مع قهوتك ☕",
   "",
   "— *tadrygcc.com*",
 ].join("\n");
+
+// Server-side greeting cache: refetch every hour so new episodes appear
+// in the «latest 5» list without a Baileys restart.
+const GREETING_TTL_MS = 60 * 60 * 1000;
+let greetingCache = { text: GREETING_FALLBACK, at: 0 };
+
+async function getGreeting() {
+  const now = Date.now();
+  if (greetingCache.text && now - greetingCache.at < GREETING_TTL_MS) {
+    return greetingCache.text;
+  }
+  if (!GREETING_URL) return GREETING_FALLBACK;
+  try {
+    const r = await fetch(GREETING_URL, { signal: AbortSignal.timeout(6_000) });
+    if (!r.ok) throw new Error(`greeting api ${r.status}`);
+    const data = await r.json();
+    if (typeof data.text === "string" && data.text.length > 20) {
+      greetingCache = { text: data.text, at: now };
+      return data.text;
+    }
+    throw new Error("greeting api returned empty text");
+  } catch (err) {
+    log.warn({ err: String(err) }, "greeting fetch failed — using fallback");
+    return GREETING_FALLBACK;
+  }
+}
 
 const BRAND_FOOTER = "\n\n—\n_اسأل تدري؟ · tadrygcc.com_";
 
@@ -388,11 +416,14 @@ async function start() {
         const fromId = m.key.remoteJid;
         log.info({ from: fromId, len: text.length }, "incoming");
 
-        // First-time greeting. Send once per jid per bot lifetime.
+        // First-time greeting. Fetches from /api/greeting so tweaks
+        // (new commands, updated latest-5 list) don't require a Baileys
+        // redeploy. Falls back to hardcoded string on network error.
         if (!greetedUsers.has(fromId)) {
           greetedUsers.add(fromId);
           try {
-            await sock.sendMessage(fromId, { text: GREETING });
+            const greetingText = await getGreeting();
+            await sock.sendMessage(fromId, { text: greetingText });
           } catch (err) {
             log.warn({ err: String(err) }, "greeting failed");
           }
