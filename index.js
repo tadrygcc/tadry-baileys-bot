@@ -130,8 +130,13 @@ const BRAND_FOOTER = "\n\n—\n_اسأل تدري؟ · tadrygcc.com_";
 
 let subscribers = new Map();
 
-function newSubRecord() {
-  return { subscribed_at: Date.now(), paid: false, paid_at: null };
+function newSubRecord(name) {
+  return {
+    subscribed_at: Date.now(),
+    paid: false,
+    paid_at: null,
+    name: typeof name === "string" && name.trim() ? name.trim() : null,
+  };
 }
 
 async function loadSubscribers() {
@@ -155,6 +160,7 @@ async function loadSubscribers() {
           subscribed_at: typeof meta?.subscribed_at === "number" ? meta.subscribed_at : 0,
           paid: meta?.paid === true,
           paid_at: typeof meta?.paid_at === "number" ? meta.paid_at : null,
+          name: typeof meta?.name === "string" ? meta.name : null,
         });
       }
       log.info(`loaded ${subscribers.size} subscriber(s) from ${SUBSCRIBERS_FILE}`);
@@ -395,6 +401,7 @@ function startHttpServer(sockRef) {
           subscribed_at: meta.subscribed_at || null,
           paid: meta.paid === true,
           paid_at: meta.paid_at || null,
+          name: meta.name || null,
         });
       }
       // Newest first — most recent joins are the most interesting.
@@ -738,7 +745,11 @@ async function start() {
         if (!text || typeof text !== "string" || text.trim().length === 0) continue;
 
         const fromId = m.key.remoteJid;
-        log.info({ from: fromId, len: text.length }, "incoming");
+        // WA sets pushName to the sender's WhatsApp display name on
+        // every incoming message. Cache it so the admin panel can
+        // show "Yousef" instead of the opaque @lid identifier.
+        const pushName = typeof m.pushName === "string" ? m.pushName : null;
+        log.info({ from: fromId, name: pushName, len: text.length }, "incoming");
 
         // First-time greeting. Fetches from /api/greeting so tweaks
         // (new commands, updated latest-5 list) don't require a Baileys
@@ -763,7 +774,15 @@ async function start() {
             "subscribe intent"
           );
           if (wasNew) {
-            subscribers.set(fromId, newSubRecord());
+            subscribers.set(fromId, newSubRecord(pushName));
+          } else if (pushName) {
+            // Backfill/refresh the display name on returning subs so
+            // admin panel keeps the latest name if the user updated it.
+            const existing = subscribers.get(fromId);
+            if (existing && existing.name !== pushName) {
+              existing.name = pushName;
+              subscribers.set(fromId, existing);
+            }
           }
           await saveSubscribers();
           log.info(
