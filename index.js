@@ -331,6 +331,32 @@ function startHttpServer(sockRef) {
           ok: true,
           subs: subscribers.size,
           paid: subsInTarget("paid").length,
+          pid: process.pid,
+          uptime_s: Math.round(process.uptime()),
+        })
+      );
+      return;
+    }
+
+    // Diagnostic dump — reveals process identity + full subs contents so
+    // we can distinguish between "empty Map" and "two-process divergence".
+    // Secret-gated because it exposes phone numbers.
+    if (req.method === "GET" && req.url === "/debug/state") {
+      if (!requireSecret(req, res)) return;
+      const subsArr = [];
+      for (const [jid, meta] of subscribers) {
+        subsArr.push({ jid, ...meta });
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          pid: process.pid,
+          uptime_s: Math.round(process.uptime()),
+          started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+          subs_size: subscribers.size,
+          subs_dump: subsArr,
+          sock_ready: sock != null,
+          subscribers_file: SUBSCRIBERS_FILE,
         })
       );
       return;
@@ -684,10 +710,18 @@ async function start() {
         // reassures them rather than errors.
         if (isSubscribeIntent(text)) {
           const wasNew = !subscribers.has(fromId);
+          log.info(
+            { fromId, wasNew, sizeBefore: subscribers.size, pid: process.pid },
+            "subscribe intent"
+          );
           if (wasNew) {
             subscribers.set(fromId, newSubRecord());
           }
           await saveSubscribers();
+          log.info(
+            { fromId, sizeAfter: subscribers.size, pid: process.pid },
+            "subscribe done"
+          );
           const msg = wasNew
             ? "✓ اشتركت في *موجز تدري* ☕\n_يوصلك كلّ صباح الساعة ٨ بتوقيت الخليج، مع قهوتك._\n\nتبي توقف؟ اكتب *«إيقاف»*."
             : "أنت مشترك بالفعل في *موجز تدري* ☕\n_يوصلك كلّ صباح الساعة ٨ بتوقيت الخليج._";
