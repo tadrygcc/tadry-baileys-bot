@@ -645,6 +645,7 @@ async function start() {
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
+    console.log(`[conn.update] connection=${connection ?? "(none)"} qr=${qr ? "yes" : "no"} code=${lastDisconnect?.error?.output?.statusCode ?? "-"}`);
     if (qr) {
       console.log("\n=== SCAN THIS QR FROM YOUR TADRY WHATSAPP BUSINESS APP ===");
       console.log("Settings → Linked Devices → Link a Device\n");
