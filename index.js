@@ -643,6 +643,31 @@ async function start() {
 
   sock.ev.on("creds.update", saveCreds);
 
+  // Pairing-code linking: if PAIRING_PHONE is set and this Baileys
+  // instance has no registered creds yet, request an 8-digit code
+  // from WA. User enters it in WA → Linked Devices → Link with phone
+  // number. This bypasses the QR scanner which has been rejecting
+  // scans intermittently against current WA builds.
+  //
+  // PAIRING_PHONE must be the E.164 number without the '+', e.g.
+  // 96555555555 for a Kuwait number.
+  const pairingPhone = (process.env.PAIRING_PHONE || "").replace(/\D/g, "");
+  if (pairingPhone && !sock.authState.creds.registered) {
+    // Give the socket a moment to negotiate the initial WS frames
+    // before requesting the code — Baileys errors if called too early.
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(pairingPhone);
+        const pretty = code.match(/.{1,4}/g)?.join("-") || code;
+        console.log("\n=== PAIRING CODE ===");
+        console.log(`Enter this in WhatsApp → Settings → Linked Devices → Link a Device → Link with phone number:\n\n    ${pretty}\n`);
+        console.log("The code expires in ~60 seconds. If it fails, redeploy the service to get a new one.\n");
+      } catch (err) {
+        console.error(`[pairing] requestPairingCode failed: ${err}`);
+      }
+    }, 3000);
+  }
+
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
     console.log(`[conn.update] connection=${connection ?? "(none)"} qr=${qr ? "yes" : "no"} code=${lastDisconnect?.error?.output?.statusCode ?? "-"}`);
