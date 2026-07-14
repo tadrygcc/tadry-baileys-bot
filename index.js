@@ -19,6 +19,7 @@ import qrcodeTerminal from "qrcode-terminal";
 import cron from "node-cron";
 import fs from "node:fs/promises";
 import path from "node:path";
+import http from "node:http";
 
 const API_URL = process.env.TADRY_API_URL;
 const API_SECRET = process.env.BOT_SHARED_SECRET || "";
@@ -209,6 +210,115 @@ async function pushBriefToAllSubscribers(sock) {
 }
 
 // ------------------------------------------------------------
+// Ad-hoc push: admin-triggered from tadrygcc.com/admin. Delivered to
+// all current subscribers (paid filter comes in a future phase).
+// Silent hours 22:00–06:00 Gulf enforced server-side so an accidental
+// tap at 3 AM can't ping everyone.
+// ------------------------------------------------------------
+
+const PUSH_ALERT_FOOTER = "\n\n—\n_تنبيه تدري · tadrygcc.com_";
+const PUSH_SEND_DELAY_MS = 500;
+
+function isSilentHourNow() {
+  // Convert current UTC to Asia/Riyadh (UTC+3 fixed, no DST).
+  const nowUtcH = new Date().getUTCHours();
+  const gulfH = (nowUtcH + 3) % 24;
+  return gulfH >= 22 || gulfH < 6;
+}
+
+async function pushAlertToAllSubscribers(sock, text) {
+  if (subscribers.size === 0) return { sent: 0, failed: 0, total: 0 };
+  const body = text + PUSH_ALERT_FOOTER;
+  let sent = 0;
+  let failed = 0;
+  for (const jid of subscribers) {
+    try {
+      await sock.sendMessage(jid, { text: body });
+      sent++;
+    } catch (err) {
+      failed++;
+      log.warn({ err: String(err), jid }, "ad-hoc push: send failed");
+    }
+    await new Promise((res) => setTimeout(res, PUSH_SEND_DELAY_MS));
+  }
+  return { sent, failed, total: subscribers.size };
+}
+
+// Minimal HTTP server so tadry-web /api/admin/push can dispatch alerts
+// without needing a polling queue. Railway auto-exposes $PORT and gives
+// this service a public URL, which the admin config points at.
+function startPushHttpServer(sock) {
+  const port = Number(process.env.PORT) || 8080;
+  const server = http.createServer(async (req, res) => {
+    // Health check for Railway's default probes.
+    if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, subs: subscribers.size }));
+      return;
+    }
+    if (req.method !== "POST" || req.url !== "/push") {
+      res.writeHead(404).end();
+      return;
+    }
+    if ((req.headers["x-bot-secret"] || "") !== API_SECRET) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 20_000) {
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      try {
+        const parsed = JSON.parse(body || "{}");
+        const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+        const override = parsed.override_silent === true;
+        if (!text || text.length < 3) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "empty" }));
+          return;
+        }
+        if (text.length > 3000) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "too long" }));
+          return;
+        }
+        if (isSilentHourNow() && !override) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "silent_hours",
+              message:
+                "Silent hours 22:00-06:00 Asia/Riyadh. Pass override_silent:true to force.",
+            })
+          );
+          return;
+        }
+        log.info(
+          { chars: text.length, subs: subscribers.size },
+          "ad-hoc push starting"
+        );
+        const result = await pushAlertToAllSubscribers(sock, text);
+        log.info(result, "ad-hoc push done");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        log.error({ err: String(err) }, "push endpoint crashed");
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: String(err) }));
+      }
+    });
+  });
+  server.listen(port, () => {
+    log.info(`push http server listening on :${port}`);
+  });
+}
+
+// ------------------------------------------------------------
 
 async function askTadry({ text, fromId, history }) {
   const r = await fetch(API_URL, {
@@ -362,6 +472,16 @@ async function start() {
     }
     if (connection === "open") {
       log.info("connected to WhatsApp as Tadry");
+      // Boot the push HTTP server exactly once, after the first successful
+      // WA connect (so sock is ready to send when a push arrives).
+      if (!global.__pushServerStarted) {
+        global.__pushServerStarted = true;
+        try {
+          startPushHttpServer(sock);
+        } catch (err) {
+          log.error({ err: String(err) }, "push http server failed to start");
+        }
+      }
       // Arm the daily brief cron the first time we successfully connect.
       // Reconnects re-enter this branch but node-cron's schedule is
       // idempotent per (cron, callback, tz) key — we guard with a flag.
