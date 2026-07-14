@@ -12,7 +12,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.10",
+    "@whiskeysockets/baileys": "^6.7.23",
     "node-cron": "^3.0.3",
     "pino": "^9.5.0",
     "qrcode-terminal": "^0.12.0"
