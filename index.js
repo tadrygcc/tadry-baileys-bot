@@ -318,9 +318,11 @@ async function readJsonBody(req, res, maxBytes = 20_000) {
   });
 }
 
-function startPushHttpServer(sock) {
+function startHttpServer(sockRef) {
   const port = Number(process.env.PORT) || 8080;
+  console.log(`[http] boot: attempting to listen on port ${port} (PORT env=${process.env.PORT ?? "(unset)"})`);
   const server = http.createServer(async (req, res) => {
+    const sock = sockRef.current;
     // Health check for Railway's default probes.
     if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
       res.writeHead(200, { "content-type": "application/json" });
@@ -383,6 +385,11 @@ function startPushHttpServer(sock) {
       return;
     }
     if (!requireSecret(req, res)) return;
+    if (!sock) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "wa not ready", message: "WhatsApp socket not connected yet — retry in a few seconds." }));
+      return;
+    }
 
     const parsed = await readJsonBody(req, res);
     if (parsed === null) return;
@@ -428,8 +435,13 @@ function startPushHttpServer(sock) {
       res.end(JSON.stringify({ error: String(err) }));
     }
   });
-  server.listen(port, () => {
-    log.info(`push http server listening on :${port}`);
+  server.on("error", (err) => {
+    console.error(`[http] server error: ${err}`);
+  });
+  // Bind to 0.0.0.0 explicitly — some container platforms won't route
+  // to a service that binds only to 127.0.0.1 (the Node default).
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`[http] listening on 0.0.0.0:${port}`);
   });
 }
 
@@ -550,6 +562,16 @@ function firstTime(id) {
 async function start() {
   await loadSubscribers();
 
+  // Start the HTTP server *immediately*, before we await the WA socket.
+  // Rationale: Railway's edge routes to $PORT the moment the container
+  // is marked ready, and if the port isn't listening it returns
+  // "Application failed to respond" (502). Waiting for WA connect
+  // means Railway may probe the port before our HTTP server is up.
+  // The push/subs handlers close over `sockRef.current` so we can wire
+  // the socket in once WA connects.
+  const sockRef = { current: null };
+  startHttpServer(sockRef);
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -587,16 +609,9 @@ async function start() {
     }
     if (connection === "open") {
       log.info("connected to WhatsApp as Tadry");
-      // Boot the push HTTP server exactly once, after the first successful
-      // WA connect (so sock is ready to send when a push arrives).
-      if (!global.__pushServerStarted) {
-        global.__pushServerStarted = true;
-        try {
-          startPushHttpServer(sock);
-        } catch (err) {
-          log.error({ err: String(err) }, "push http server failed to start");
-        }
-      }
+      // Hand the socket to the HTTP server so push/subs endpoints
+      // can send messages. HTTP server was started earlier in start().
+      sockRef.current = sock;
       // Arm the daily brief cron the first time we successfully connect.
       // Reconnects re-enter this branch but node-cron's schedule is
       // idempotent per (cron, callback, tz) key — we guard with a flag.
