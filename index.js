@@ -119,24 +119,53 @@ async function getGreeting() {
 const BRAND_FOOTER = "\n\n—\n_اسأل تدري؟ · tadrygcc.com_";
 
 // ------------------------------------------------------------
-// Subscribers: persistent set of jids that want the daily push
+// Subscribers: map keyed by jid → { subscribed_at, paid, paid_at }.
+// Persisted as a plain object to /data/subscribers.json.
+//
+// Format history:
+//   v0 (early): ["jid1", "jid2"]                — just an array of jids
+//   v1 (current): { "jid1": { subscribed_at, paid, paid_at }, ... }
+// loadSubscribers() promotes v0 files to v1 on read.
 // ------------------------------------------------------------
 
-let subscribers = new Set();
+let subscribers = new Map();
+
+function newSubRecord() {
+  return { subscribed_at: Date.now(), paid: false, paid_at: null };
+}
 
 async function loadSubscribers() {
   try {
     const raw = await fs.readFile(SUBSCRIBERS_FILE, "utf8");
-    const arr = JSON.parse(raw);
-    subscribers = new Set(Array.isArray(arr) ? arr : []);
-    log.info(`loaded ${subscribers.size} subscriber(s) from ${SUBSCRIBERS_FILE}`);
+    const parsed = JSON.parse(raw);
+    subscribers = new Map();
+    if (Array.isArray(parsed)) {
+      // v0 → v1 promotion: unknown subscribe time so leave it at 0.
+      for (const jid of parsed) {
+        if (typeof jid === "string" && jid.length > 0) {
+          subscribers.set(jid, { subscribed_at: 0, paid: false, paid_at: null });
+        }
+      }
+      log.info(`loaded ${subscribers.size} subscriber(s) [v0 array, promoted]`);
+      // Persist immediately in v1 shape so we only promote once.
+      await saveSubscribers();
+    } else if (parsed && typeof parsed === "object") {
+      for (const [jid, meta] of Object.entries(parsed)) {
+        subscribers.set(jid, {
+          subscribed_at: typeof meta?.subscribed_at === "number" ? meta.subscribed_at : 0,
+          paid: meta?.paid === true,
+          paid_at: typeof meta?.paid_at === "number" ? meta.paid_at : null,
+        });
+      }
+      log.info(`loaded ${subscribers.size} subscriber(s) from ${SUBSCRIBERS_FILE}`);
+    }
   } catch (err) {
     if (err && err.code === "ENOENT") {
       log.info(`no subscribers file at ${SUBSCRIBERS_FILE} yet — starting empty`);
     } else {
       log.warn({ err: String(err) }, "failed to load subscribers — starting empty");
     }
-    subscribers = new Set();
+    subscribers = new Map();
   }
 }
 
@@ -145,11 +174,22 @@ async function saveSubscribers() {
     await fs.mkdir(DATA_DIR, { recursive: true });
     await fs.writeFile(
       SUBSCRIBERS_FILE,
-      JSON.stringify([...subscribers], null, 2)
+      JSON.stringify(Object.fromEntries(subscribers), null, 2)
     );
   } catch (err) {
     log.error({ err: String(err) }, "failed to save subscribers");
   }
+}
+
+function subsInTarget(target) {
+  // target: "all" | "paid" | "free"
+  const jids = [];
+  for (const [jid, meta] of subscribers) {
+    if (target === "paid" && !meta.paid) continue;
+    if (target === "free" && meta.paid) continue;
+    jids.push(jid);
+  }
+  return jids;
 }
 
 // اشتراك / اشترك / subscribe — match the whole trimmed message so a
@@ -195,7 +235,9 @@ async function pushBriefToAllSubscribers(sock) {
   }
   const body = text + BRAND_FOOTER;
   let sent = 0;
-  for (const jid of subscribers) {
+  // Morning brief goes to *all* subscribers regardless of paid tier —
+  // the free promise is the morning coffee brief.
+  for (const jid of subscribers.keys()) {
     try {
       await sock.sendMessage(jid, { text: body });
       sent++;
@@ -226,12 +268,13 @@ function isSilentHourNow() {
   return gulfH >= 22 || gulfH < 6;
 }
 
-async function pushAlertToAllSubscribers(sock, text) {
-  if (subscribers.size === 0) return { sent: 0, failed: 0, total: 0 };
+async function pushAlertToSubscribers(sock, text, target) {
+  const jids = subsInTarget(target);
+  if (jids.length === 0) return { sent: 0, failed: 0, total: 0, target };
   const body = text + PUSH_ALERT_FOOTER;
   let sent = 0;
   let failed = 0;
-  for (const jid of subscribers) {
+  for (const jid of jids) {
     try {
       await sock.sendMessage(jid, { text: body });
       sent++;
@@ -241,77 +284,149 @@ async function pushAlertToAllSubscribers(sock, text) {
     }
     await new Promise((res) => setTimeout(res, PUSH_SEND_DELAY_MS));
   }
-  return { sent, failed, total: subscribers.size };
+  return { sent, failed, total: jids.length, target };
 }
 
 // Minimal HTTP server so tadry-web /api/admin/push can dispatch alerts
 // without needing a polling queue. Railway auto-exposes $PORT and gives
 // this service a public URL, which the admin config points at.
+function requireSecret(req, res) {
+  if ((req.headers["x-bot-secret"] || "") !== API_SECRET) {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return false;
+  }
+  return true;
+}
+
+async function readJsonBody(req, res, maxBytes = 20_000) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > maxBytes) req.destroy();
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(body || "{}"));
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "bad json" }));
+        resolve(null);
+      }
+    });
+  });
+}
+
 function startPushHttpServer(sock) {
   const port = Number(process.env.PORT) || 8080;
   const server = http.createServer(async (req, res) => {
     // Health check for Railway's default probes.
     if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, subs: subscribers.size }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          subs: subscribers.size,
+          paid: subsInTarget("paid").length,
+        })
+      );
       return;
     }
+
+    // GET /subs — list subscribers with metadata. Secret-gated because
+    // this is a PII-shaped payload (phone numbers) — same rule as /push.
+    if (req.method === "GET" && req.url === "/subs") {
+      if (!requireSecret(req, res)) return;
+      const list = [];
+      for (const [jid, meta] of subscribers) {
+        list.push({
+          jid,
+          subscribed_at: meta.subscribed_at || null,
+          paid: meta.paid === true,
+          paid_at: meta.paid_at || null,
+        });
+      }
+      // Newest first — most recent joins are the most interesting.
+      list.sort((a, b) => (b.subscribed_at || 0) - (a.subscribed_at || 0));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ subs: list, total: list.length }));
+      return;
+    }
+
+    // POST /subs/paid — flip a subscriber's paid flag.
+    // Body: { jid, paid: boolean }
+    if (req.method === "POST" && req.url === "/subs/paid") {
+      if (!requireSecret(req, res)) return;
+      const body = await readJsonBody(req, res);
+      if (body === null) return;
+      const jid = typeof body.jid === "string" ? body.jid : "";
+      const paid = body.paid === true;
+      if (!jid || !subscribers.has(jid)) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "no such subscriber" }));
+        return;
+      }
+      const meta = subscribers.get(jid);
+      meta.paid = paid;
+      meta.paid_at = paid ? Date.now() : null;
+      subscribers.set(jid, meta);
+      await saveSubscribers();
+      log.info({ jid, paid }, "paid flag updated");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, jid, paid: meta.paid, paid_at: meta.paid_at }));
+      return;
+    }
+
     if (req.method !== "POST" || req.url !== "/push") {
       res.writeHead(404).end();
       return;
     }
-    if ((req.headers["x-bot-secret"] || "") !== API_SECRET) {
-      res.writeHead(401, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "unauthorized" }));
-      return;
-    }
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 20_000) {
-        req.destroy();
+    if (!requireSecret(req, res)) return;
+
+    const parsed = await readJsonBody(req, res);
+    if (parsed === null) return;
+    try {
+      const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+      const override = parsed.override_silent === true;
+      const target =
+        parsed.target === "paid" || parsed.target === "free"
+          ? parsed.target
+          : "all";
+      if (!text || text.length < 3) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "empty" }));
+        return;
       }
-    });
-    req.on("end", async () => {
-      try {
-        const parsed = JSON.parse(body || "{}");
-        const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
-        const override = parsed.override_silent === true;
-        if (!text || text.length < 3) {
-          res.writeHead(400, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "empty" }));
-          return;
-        }
-        if (text.length > 3000) {
-          res.writeHead(400, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "too long" }));
-          return;
-        }
-        if (isSilentHourNow() && !override) {
-          res.writeHead(409, { "content-type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "silent_hours",
-              message:
-                "Silent hours 22:00-06:00 Asia/Riyadh. Pass override_silent:true to force.",
-            })
-          );
-          return;
-        }
-        log.info(
-          { chars: text.length, subs: subscribers.size },
-          "ad-hoc push starting"
+      if (text.length > 3000) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "too long" }));
+        return;
+      }
+      if (isSilentHourNow() && !override) {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "silent_hours",
+            message:
+              "Silent hours 22:00-06:00 Asia/Riyadh. Pass override_silent:true to force.",
+          })
         );
-        const result = await pushAlertToAllSubscribers(sock, text);
-        log.info(result, "ad-hoc push done");
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(result));
-      } catch (err) {
-        log.error({ err: String(err) }, "push endpoint crashed");
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: String(err) }));
+        return;
       }
-    });
+      log.info(
+        { chars: text.length, target, subs: subscribers.size },
+        "ad-hoc push starting"
+      );
+      const result = await pushAlertToSubscribers(sock, text, target);
+      log.info(result, "ad-hoc push done");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      log.error({ err: String(err) }, "push endpoint crashed");
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: String(err) }));
+    }
   });
   server.listen(port, () => {
     log.info(`push http server listening on :${port}`);
@@ -554,7 +669,9 @@ async function start() {
         // reassures them rather than errors.
         if (isSubscribeIntent(text)) {
           const wasNew = !subscribers.has(fromId);
-          subscribers.add(fromId);
+          if (wasNew) {
+            subscribers.set(fromId, newSubRecord());
+          }
           await saveSubscribers();
           const msg = wasNew
             ? "✓ اشتركت في *موجز تدري* ☕\n_يوصلك كلّ صباح الساعة ٨ بتوقيت الخليج، مع قهوتك._\n\nتبي توقف؟ اكتب *«إيقاف»*."
