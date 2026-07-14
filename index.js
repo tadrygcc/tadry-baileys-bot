@@ -338,6 +338,28 @@ function startHttpServer(sockRef) {
       return;
     }
 
+    // Nuclear reset: wipe the stale auth_info directory and exit so
+    // Railway restarts the container fresh. Used when we've unlinked all
+    // WA devices from the phone side and need Baileys to abandon its
+    // stored session and print a new QR. Secret-gated. POST-only so
+    // curious GETs from misconfigured tools don't accidentally reset.
+    if (req.method === "POST" && req.url === "/debug/reset-auth") {
+      if (!requireSecret(req, res)) return;
+      try {
+        const fsSync = await import("node:fs");
+        fsSync.rmSync(AUTH_DIR, { recursive: true, force: true });
+        console.log(`[reset] wiped auth dir ${AUTH_DIR} — exiting for Railway to restart`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, wiped: AUTH_DIR, exiting: true }));
+        // Give the response a moment to flush before exit.
+        setTimeout(() => process.exit(0), 500);
+      } catch (err) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: String(err) }));
+      }
+      return;
+    }
+
     // Diagnostic dump — reveals process identity + full subs contents so
     // we can distinguish between "empty Map" and "two-process divergence".
     // Secret-gated because it exposes phone numbers.
